@@ -3,15 +3,7 @@
 jdk:
   - openjdk8
 
-# 构建前的准备工作(如果需要)
-before_install:
-  - echo "准备构建..."
-
 # 自定义安装命令
 install:
   - mvn clean install -DskipTests -Dmaven.javadoc.skip=true
-
-# 环境变量(如果需要)
-env:
-  - MAVEN_OPTS="-Xmx2048m"
 
