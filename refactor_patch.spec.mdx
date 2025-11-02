@@ -1,0 +1,107 @@
+# DungeonMap Graphviz 渲染补丁方案（纯 Java 字体度量）
+
+## 背景
+- 迁移到 `graphviz-java` Graal 引擎后，`DungeonMap` 在无头/精简 Linux 环境渲染失败，日志报错 `Could not initialize class guru.nidi.graphviz.engine.FontMeasurer` 与 `Fontconfig head is null`。
+- 根因：`graphviz-java` 默认通过 AWT + 系统 `fontconfig` 库测量字体宽度；若容器未安装字体与相关原生库，即会在类初始化阶段崩溃。
+- 约束：不修改 Docker 镜像，也不依赖宿主机字体，需要完全由 Java 代码自给自足。
+
+## 方案概览
+- 新增纯 Java 依赖，改写 `FontMeasurer` 实现，改用内嵌 TTF 字体并利用 `fontbox` 直接读取字形宽度。
+- 保持 Graal 渲染链路，无需额外外部命令或系统库。
+
+## Gradle (Kotlin DSL) 依赖
+
+```kotlin
+dependencies {
+    implementation("guru.nidi:graphviz-java:0.18.1")
+    implementation("org.graalvm.js:js:23.1.0")
+
+    // 新增：内置 TTF 字体资源
+    implementation("de.sciss:liberation-fonts:1.07.4")
+    // 新增：解析 TrueType 字体并提取 advance width
+    implementation("org.apache.pdfbox:fontbox:2.0.31")
+}
+```
+
+> 若项目已有版本常量，请按既有方式抽取。`fontbox` 纯 Java，无 JNI 依赖。
+
+## 代码调整
+
+### 1. 覆盖 `FontMeasurer`
+在源码目录新建 `src/main/kotlin/guru/nidi/graphviz/engine/FontMeasurer.kt`（或 Java 对应文件），以下为 Kotlin 示例：
+
+```kotlin
+package guru.nidi.graphviz.engine
+
+import org.apache.fontbox.ttf.CmapLookup
+import org.apache.fontbox.ttf.CmapTable
+import org.apache.fontbox.ttf.TTFParser
+import java.io.InputStream
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.min
+
+object FontMeasurer {
+    private val cache = ConcurrentHashMap<String, DoubleArray>()
+
+    private val fontFiles = mapOf(
+        "Times-Roman" to "/de/sciss/liberation/fonts/LiberationSerif-Regular.ttf",
+        "Times" to "/de/sciss/liberation/fonts/LiberationSerif-Regular.ttf",
+        "Helvetica" to "/de/sciss/liberation/fonts/LiberationSans-Regular.ttf",
+        "Arial" to "/de/sciss/liberation/fonts/LiberationSans-Regular.ttf",
+        "Courier" to "/de/sciss/liberation/fonts/LiberationMono-Regular.ttf",
+        "Courier New" to "/de/sciss/liberation/fonts/LiberationMono-Regular.ttf"
+    )
+
+    @JvmStatic
+    fun measureFont(name: String): DoubleArray =
+        cache.computeIfAbsent(name) { loadMetrics(it) }
+
+    private fun loadMetrics(name: String): DoubleArray {
+        val location = fontFiles[name] ?: return DoubleArray(0)
+        val stream = FontMeasurer::class.java.getResourceAsStream(location) ?: return DoubleArray(0)
+
+        stream.use { input ->
+            val font = TTFParser().parse(input)
+            font.use {
+                val unitsPerEm = font.header.unitsPerEm.toDouble().takeIf { it > 0 } ?: 1000.0
+                val cmap = selectCmap(font.cmap)
+                val metrics = font.horizontalMetrics
+                val advances = metrics.advanceWidth
+
+                return DoubleArray(256) { code ->
+                    val glyphId = cmap.getGlyphId(code)
+                    val width = advances[min(glyphId, advances.size - 1)]
+                    width / unitsPerEm
+                }
+            }
+        }
+    }
+
+    private fun selectCmap(table: CmapTable): CmapLookup =
+        table.cmaps.firstOrNull { it.platformId == 3 && it.platformEncodingId == 1 }
+            ?: table.cmaps.firstOrNull { it.platformId == 0 }
+            ?: table.cmaps.first()
+}
+```
+
+- 类路径与 `graphviz-java` 原类一致，编译产物会优先于依赖 Jar，达到“覆盖”效果。
+- 对于未映射字体返回空数组，`viz.js` 会退回默认宽度逻辑。
+- 如需支持更多字体，可扩展 `fontFiles`，将路径指向 `liberation-fonts` 中的其他变体或自备 TTF。
+
+### 2. 保持原有初始化
+- 仍在插件启动时调用 `Graphviz.useEngine(GraphvizGraalEngine())`。
+- 不再需要注册系统字体，也无需操控 `GraphicsEnvironment`。
+
+## 验证步骤
+1. 在先前报错的容器环境运行地牢生成流程，确认 `FontMeasurer` 日志不再出现错误。
+2. 检查输出的 PNG/JPG/mini map，确保文本未出现明显裁剪或重叠。
+3. 如需更严格验证，可对比 CLI 版本的节点尺寸，若发现误差过大，可补充额外字体映射或调优 width 计算。
+
+## 风险与对策
+- **字体覆盖有限**：当前仅覆盖 Times/Helvetica/Courier 系列，若 DOT 中使用其他字体需继续扩展映射。
+- **布局差异**：新算法基于字形 advance width，理论值与 CLI 基本一致；若仍有差距，可引入更多字体样本或缓存手工校准值。
+- **依赖体积**：`fontbox` + liberation 字体约 7MB，如对包体积敏感，可在打包阶段剔除未使用的字体文件。
+
+## 总结
+- 通过新增 `fontbox` 与 `liberation-fonts` 依赖，并覆写 `FontMeasurer`，实现纯 Java 字体度量，消除对系统 `fontconfig` 的依赖。
+- 无需修改 Docker 镜像，即可在头less 环境完成 Graphviz PNG/Plain 渲染。

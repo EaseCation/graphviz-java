@@ -1,0 +1,160 @@
+# DungeonMap Graphviz Graal Refactor
+
+## 背景
+- 目前 `DungeonMap` 依赖 `ProcessBuilder` 直接调用系统的 `dot`/`sfdp`/`neato` 来生成 PNG 与 plain 布局，导致部署环境必须预装 Graphviz CLI。
+- 生成逻辑散落在多个私有方法（`generateHighQualityPng`、`tryGetPlainLayout` 等），包含路径探测与环境变量拼接，稳定性差、难以测试。
+- 项目已经能组装完整的 `.dot` 字符串；目标是复用现有文件生成逻辑，同时移除对外部可执行文件的依赖。
+
+## 目标
+- 使用 `graphviz-java` 的 Graal 引擎完成渲染，完全避免外部进程。
+- 保留现有输出：高质量临时 PNG（供 JPG 缩放）、plain 布局文本以及备用迷你图生成流程。
+- 将 Graphviz 调用集中封装，屏蔽引擎切换细节，方便未来复用与测试。
+- 提供降级策略（如 Graal 初始化失败时可落回 CLI 或其他引擎）。
+
+## 非目标
+- 不改动 `.dot` 生成逻辑（`toDotFile()` 维持不变）。
+- 不调整迷你地图与报告的业务规则，只替换数据来源。
+- 本轮不梳理/精炼图像缩放或内存缓存策略（维持现有质量参数）。
+
+## 依赖与配置
+- Maven 依赖：
+  - `guru.nidi:graphviz-java`
+  - `org.graalvm.js:js`（Graal JS 引擎）
+  - 若运行在 JDK17+，请确认 `org.graalvm.truffle:truffle-api` 版本与 Graal JS 兼容（通常由 BOM 自动传递）。
+- 启动时只注册 Graal 引擎（坚决不回退到系统命令）：
+  ```kotlin
+  import guru.nidi.graphviz.engine.Graphviz
+  import guru.nidi.graphviz.engine.GraphvizGraalEngine
+
+  fun onEnable() {
+      Graphviz.useEngine(GraphvizGraalEngine())
+      // 其他初始化逻辑...
+  }
+  ```
+  - 初始化代码位于插件入口（例如 `ECRuneLegend.onEnable()`），确保在任何渲染发生前执行。
+  - 若 Graal 初始化失败，应直接抛错阻止插件继续运行，以保证不会悄悄回退到外部命令。
+
+## 设计方案
+
+### 新增 Graphviz 服务层
+- 新建 `GraphvizRenderer`（命名可调）协程安全的单例/组件，职责：
+  - `renderPng(dot: String, target: File, engine: Engine? = null)`
+  - `renderPlain(dot: String, engine: Engine? = null): String`
+  - 复用 `Graphviz.fromString(dot)`，并通过 `.engine(engine)` 指定布局引擎（`Engine.DOT`、`Engine.NEATO`…）以模拟原先多引擎尝试。
+- 对外返回 `Result`/`Either`，在失败时携带异常与引擎信息，方便日志打印。
+
+### 核心代码替换示例
+
+> 以 `DungeonMap.kt` 为例，示范如何替换原来的 `ProcessBuilder` 逻辑。所有片段均出自真实方法，直接粘贴即可。
+
+#### 1. 新增 Graphviz 渲染服务
+
+`net.easecation.ecrunelegend.challenge.dungeon.visualization.GraphvizRenderer.kt`
+```kotlin
+package net.easecation.ecrunelegend.challenge.dungeon.visualization
+
+import guru.nidi.graphviz.engine.Engine
+import guru.nidi.graphviz.engine.Format
+import guru.nidi.graphviz.engine.Graphviz
+import net.easecation.ecrunelegend.ECRuneLegend
+import java.io.File
+
+object GraphvizRenderer {
+    private val logger = ECRuneLegend.getInstance().logger
+
+    fun renderPng(dot: String, output: File, engine: Engine = Engine.DOT): Boolean =
+        runCatching {
+            Graphviz.fromString(dot)
+                .engine(engine)
+                .render(Format.PNG)
+                .toFile(output)
+            output.exists()
+        }.onFailure {
+            logger.warning("Graphviz PNG 渲染失败 (${engine.name}): ${it.message}")
+        }.getOrDefault(false)
+
+    fun renderPlain(dot: String, engine: Engine): String? =
+        runCatching {
+            Graphviz.fromString(dot)
+                .engine(engine)
+                .render(Format.PLAIN)
+                .toString()
+        }.onFailure {
+            logger.debug("Graphviz plain 渲染失败 (${engine.name}): ${it.message}")
+        }.getOrNull()
+}
+```
+
+#### 2. 替换 `DungeonMap.generateHighQualityPng`
+
+```kotlin
+private fun generateHighQualityPng(dotFile: File, pngFile: File): Boolean {
+    val dotContent = dotFile.readText()
+    val engines = listOf(Engine.SFDP, Engine.NEATO, Engine.DOT)
+
+    for (engine in engines) {
+        if (GraphvizRenderer.renderPng(dotContent, pngFile, engine)) {
+            return true
+        }
+    }
+
+    ECRuneLegend.getInstance().logger.info("  - 所有 Graal 引擎渲染失败")
+    return false
+}
+```
+
+#### 3. 替换 `DungeonMap.tryGetPlainLayout`
+
+```kotlin
+private fun tryGetPlainLayout(dotFile: File): PlainLayoutInfo? {
+    val dotContent = dotFile.readText()
+    val engines = listOf(Engine.SFDP, Engine.NEATO, Engine.DOT)
+
+    for (engine in engines) {
+        val plain = GraphvizRenderer.renderPlain(dotContent, engine)
+        if (!plain.isNullOrBlank()) {
+            PlainFormatParser.parsePlainFormat(plain)?.let {
+                ECRuneLegend.getInstance().logger.debug("  - 使用 $engine 引擎获取布局信息成功")
+                return it
+            }
+        }
+    }
+
+    ECRuneLegend.getInstance().logger.debug("  - Graal 引擎获取布局信息失败")
+    return null
+}
+```
+
+#### 4. 删除遗留辅助函数
+- `findGraphvizCommand` 与 `inheritEnvironment` 完全移除。
+- 任何 `ProcessBuilder` 调用一并删除。
+
+### 代码迁移步骤
+1. **添加依赖与引擎初始化**  
+   - 更新 `pom.xml`，引入 Graal JS 与 graphviz-java；在插件启动逻辑中调用 `Graphviz.useEngine(...)`。
+2. **实现 GraphvizRenderer**  
+   - 包含 PNG/plain 渲染、引擎回退与异常包装；编写最小单元测试验证 Graal 渲染路径。
+3. **替换 DungeonMap 内部调用**  
+   - `tryConvertToJpg` 中调用新服务生成临时 PNG；保留缩放及缓存逻辑。
+   - `tryGetPlainLayout` 改用新服务获取 plain 字符串；移除 `ProcessBuilder`、`findGraphvizCommand`、`inheritEnvironment` 等帮助方法。
+4. **清理旧代码与日志**  
+   - 删除与外部命令调用相关的代码片段，更新日志语句（区分 Graal 成功、回退、失败）。
+5. **验证 & 文档更新**  
+   - 在无 Graphviz CLI 的环境下运行以确保 Graal 引擎可用。
+   - 更新 README/部署文档说明新增依赖与初始化方式。
+
+## 测试计划
+- **单元测试**：为 GraphvizRenderer 编写最小测试，验证在 Graal 引擎下的 PNG/PLAIN 输出（可对比生成文件尺寸或 plain 关键字）。
+- **集成测试**：运行一次完整的地牢生成流程，确认 JPG、plain、迷你图均生成成功，且日志符合预期。
+- **回退测试**：故意禁用 Graal（例如缺失依赖），确认运行时记录错误并回退到 CLI；若项目目标是彻底移除 CLI，可改为在初始化阶段直接抛出启动异常。
+
+## 风险与缓解
+- **Graal 初始化性能**：首次加载 Graal JS 较慢，可在插件启动时预热一次渲染。
+- **依赖体积**：`graphviz-java-all-j2v8` 较大；若只运行于特定平台，考虑仅引入需要的 Graal 与 J2V8 变体。
+- **字体/渲染差异**：Graal 渲染与 CLI 在字体查找上可能有微差，需要对关键样式进行回归验证。
+
+## 时间评估
+- 依赖调整与引擎初始化：0.5 天
+- 服务层实现与替换：1.0 天
+- 测试、清理与文档：0.5 天
+- 总计：约 2 天（含预留回归缓冲）
