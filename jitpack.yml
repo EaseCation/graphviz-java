@@ -6,4 +6,3 @@ jdk:
 # 自定义安装命令
 install:
   - mvn clean install -DskipTests -Dmaven.javadoc.skip=true
-
