@@ -29,54 +29,89 @@ final class FontMeasurer {
     private static final double COURIER_WIDTH = .5999;
     private static final Set<String> FONTS = new HashSet<>();
     
+    // 系统属性：是否禁用字体度量（默认不禁用）
+    private static final boolean FONT_MEASUREMENT_DISABLED = 
+        Boolean.getBoolean("graphviz.font.measurement.disabled");
+    
+    // 初始化状态枚举
+    private enum InitState {
+        NOT_STARTED,    // 未开始
+        SUCCESS,        // 成功
+        FAILED          // 失败
+    }
+    
+    // 使用枚举代替多个 boolean 标志，更清晰
+    private static volatile InitState initState = InitState.NOT_STARTED;
+    
     // 延迟初始化的字段
     @Nullable
-    private static volatile FontRenderContext FONT_RENDER_CONTEXT;
+    private static FontRenderContext FONT_RENDER_CONTEXT;
     @Nullable
-    private static volatile Font COURIER;
-    private static volatile double COURIER_SPACE_WIDTH;
-    private static volatile double COURIER_BORDER_WIDTH;
+    private static Font COURIER;
+    private static double COURIER_SPACE_WIDTH;
+    private static double COURIER_BORDER_WIDTH;
     @Nullable
-    private static volatile double[] COURIER_WIDTHS;
-    private static volatile boolean initialized = false;
-    private static volatile boolean initFailed = false;
+    private static double[] COURIER_WIDTHS;
 
     private FontMeasurer() {
     }
+    
+    /**
+     * 静态初始化块：在类加载时就尝试初始化
+     * 这样可以在应用启动阶段就发现问题，而不是在运行时
+     */
+    static {
+        if (FONT_MEASUREMENT_DISABLED) {
+            initState = InitState.FAILED;
+            LOG.info("字体度量功能已通过系统属性禁用 (-Dgraphviz.font.measurement.disabled=true)");
+        } else {
+            // 在类加载时就尝试初始化，而不是懒加载
+            tryInitialize();
+        }
+    }
 
-    // 懒加载初始化
-    private static boolean ensureInitialized() {
-        if (initialized) {
-            return true;
-        }
-        if (initFailed) {
-            return false;
-        }
-        
-        synchronized (FontMeasurer.class) {
-            if (initialized) {
-                return true;
-            }
-            if (initFailed) {
-                return false;
-            }
+    /**
+     * 尝试初始化字体系统
+     * 1. 在静态初始化块中调用，JVM 保证类加载的线程安全
+     * 2. 即使多线程调用，最坏情况是重复初始化，但不会导致阻塞
+     */
+    private static void tryInitialize() {
+        try {
+            // 设置 headless 模式，避免 GUI 依赖
+            System.setProperty("java.awt.headless", "true");
             
-            try {
-                FONT_RENDER_CONTEXT = new BufferedImage(1, 1, BufferedImage.TYPE_3BYTE_BGR)
-                        .createGraphics().getFontRenderContext();
-                COURIER = new Font("Courier", Font.PLAIN, 10);
-                COURIER_SPACE_WIDTH = charWidth(COURIER, ' ');
-                COURIER_BORDER_WIDTH = borderWidth(COURIER);
-                COURIER_WIDTHS = courierWidths();
-                initialized = true;
-                return true;
-            } catch (Error | Exception e) {
-                initFailed = true;
-                LOG.log(Level.WARNING, "无法初始化字体度量系统，可能缺少 fontconfig。" +
-                        "字体度量功能将被禁用。如需完整功能，请安装 fontconfig 或使用 GraphvizCmdLineEngine。", e);
-                return false;
-            }
+            FONT_RENDER_CONTEXT = new BufferedImage(1, 1, BufferedImage.TYPE_3BYTE_BGR)
+                    .createGraphics().getFontRenderContext();
+            COURIER = new Font("Courier", Font.PLAIN, 10);
+            COURIER_SPACE_WIDTH = charWidth(COURIER, ' ');
+            COURIER_BORDER_WIDTH = borderWidth(COURIER);
+            COURIER_WIDTHS = courierWidths();
+            
+            initState = InitState.SUCCESS;
+            LOG.info("字体度量系统初始化成功");
+            
+        } catch (Error | Exception e) {
+            initState = InitState.FAILED;
+            LOG.log(Level.WARNING, 
+                "字体度量系统初始化失败。字体度量功能将被禁用。\n" +
+                "可能的原因：\n" +
+                "  1. 缺少 fontconfig 库\n" +
+                "  2. AWT 环境配置问题\n" +
+                "解决方案：\n" +
+                "  1. 安装 fontconfig: \n" +
+                "     - Debian/Ubuntu: apt-get install fontconfig\n" +
+                "     - CentOS/RHEL: yum install fontconfig\n" +
+                "  2. 使用 GraphvizCmdLineEngine 代替 JS 引擎\n" +
+                "  3. 主动禁用字体度量: -Dgraphviz.font.measurement.disabled=true", 
+                e);
         }
+    }
+    
+    /**
+     * 检查字体系统是否可用
+     */
+    private static boolean isAvailable() {
+        return initState == InitState.SUCCESS;
     }
 
     private static double[] courierWidths() {
@@ -96,11 +131,12 @@ final class FontMeasurer {
     }
 
     static double[] measureFont(String name) {
-        // 如果初始化失败，返回空数组表示跳过字体度量
-        if (!ensureInitialized()) {
+        // 快速失败：如果字体系统不可用，直接返回
+        if (!isAvailable()) {
             return new double[0];
         }
         
+        // 避免重复度量同一字体
         if (FONTS.contains(name)) {
             return new double[0];
         }
